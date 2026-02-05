@@ -201,6 +201,7 @@ async def create_chat_completion(
         else:
             # Non-streaming response
             result = None
+            debug_logger.log_warning(f"start dispatch video task")
             async for chunk in generation_handler.handle_generation(
                 model=request.model,
                 prompt=prompt,
@@ -208,7 +209,7 @@ async def create_chat_completion(
                 stream=False
             ):
                 result = chunk
-
+            debug_logger.log_warning(f"start dispatch video end")
             if result:
                 # Parse the result JSON string
                 try:

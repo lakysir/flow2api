@@ -1176,6 +1176,7 @@ class GenerationHandler:
             # 非流式创建任务：后台轮询，立即返回 task_id（供上游 Java/Node 轮询进度）
             if return_task_only:
                 try:
+                    debug_logger.log_warning(f"start poll task progress background")
                     asyncio.create_task(self._poll_video_result_background(token, project_id, operations, upsample_config))
                 except Exception as e:
                     debug_logger.log_error(f"[VIDEO] failed to schedule background poll: {e}")
@@ -1185,6 +1186,7 @@ class GenerationHandler:
                     model=model_config["model_key"],
                     prompt=prompt
                 )
+                debug_logger.log_warning(f"advance poll back task progress background")
                 return
 
             # 轮询结果
@@ -1275,7 +1277,7 @@ class GenerationHandler:
                 status = operation.get("status")
 
                 # 状态更新 - 每20秒报告一次 (poll_interval=3秒, 20秒约7次轮询)
-                progress_update_interval = 7  # 每7次轮询 = 21秒
+                progress_update_interval = 2  # 每2次轮询 = 12秒
                 if attempt % progress_update_interval == 0:  # 每20秒报告一次
                     progress = min(int((attempt / max_attempts) * 100), 95)
                     # 回写 DB 进度（供 /v1/tasks/{task_id} 轮询）
@@ -1284,10 +1286,12 @@ class GenerationHandler:
                             await self.db.update_task(task_id_for_db, progress=progress)
                         except Exception:
                             pass
+                    debug_logger.log_warning(f"update task progress: {progress}")
                     if stream:
                         yield self._create_stream_chunk(f"生成进度: {progress}%\n")
 
                 # 检查状态
+                #if status == "MEDIA_GENERATION_STATUS_ACTIVE":
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
                     # 成功
                     metadata = operation["operation"].get("metadata", {})
