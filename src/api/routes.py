@@ -9,7 +9,7 @@ import time
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import verify_api_key_header
-from ..core.models import ChatCompletionRequest
+from ..core.models import ChatCompletionRequest, Task
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
 from ..core.logger import debug_logger
 
@@ -223,3 +223,42 @@ async def create_chat_completion(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _task_to_status_payload(task: Task) -> dict:
+    """将 DB Task 转为对外返回结构（兼容 nodeserve 的 SoraTaskStatusResponse）"""
+    return {
+        "task_id": task.task_id,
+        "status": task.status,
+        "progress": int(task.progress or 0),
+        "model": task.model,
+        "prompt": task.prompt,
+        "result_urls": task.result_urls,
+        "error_message": task.error_message,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        # flow2api 当前不产出这些字段，预留扩展
+        "post_id": None,
+        "watermark_free_url": None,
+        "source_result_url": None,
+    }
+
+
+@router.get("/v1/tasks/{task_id}")
+async def get_task_status(
+    task_id: str,
+    api_key: str = Depends(verify_api_key_header)
+):
+    """查询任务状态/进度/结果（给 aimh8_nodeserve /flow2api/tasks/:taskId 使用）"""
+    if not generation_handler or not getattr(generation_handler, "db", None):
+        raise HTTPException(status_code=500, detail="generation_handler/db not initialized")
+
+    tid = (task_id or "").strip()
+    if not tid:
+        raise HTTPException(status_code=400, detail="task_id is required")
+
+    task = await generation_handler.db.get_task(tid)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    return JSONResponse(content=_task_to_status_payload(task))

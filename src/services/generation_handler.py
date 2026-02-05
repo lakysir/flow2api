@@ -636,25 +636,9 @@ class GenerationHandler:
         generation_type = model_config["type"]
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
-        # 非流式模式: 只检查可用性
-        if not stream:
-            is_image = (generation_type == "image")
-            is_video = (generation_type == "video")
-            available = await self.check_token_availability(is_image, is_video)
-
-            if available:
-                if is_image:
-                    message = "所有Token可用于图片生成。请启用流式模式使用生成功能。"
-                else:
-                    message = "所有Token可用于视频生成。请启用流式模式使用生成功能。"
-            else:
-                if is_image:
-                    message = "没有可用的Token进行图片生成"
-                else:
-                    message = "没有可用的Token进行视频生成"
-
-            yield self._create_completion_response(message, is_availability_check=True)
-            return
+        # 非流式模式也允许生成：
+        # - image：同步生成并返回最终 URL（JSON）
+        # - video：仅创建任务并返回 task_id（后台轮询更新 tasks 表，供 /v1/tasks/{task_id} 查询）
 
         # 向用户展示开始信息
         if stream:
@@ -714,7 +698,7 @@ class GenerationHandler:
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
                 async for chunk in self._handle_video_generation(
-                    token, project_id, model_config, prompt, images, stream
+                    token, project_id, model_config, prompt, images, stream, return_task_only=(not stream)
                 ):
                     yield chunk
 
@@ -975,7 +959,8 @@ class GenerationHandler:
         model_config: dict,
         prompt: str,
         images: Optional[List[bytes]],
-        stream: bool
+        stream: bool,
+        return_task_only: bool = False
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
 
@@ -984,6 +969,9 @@ class GenerationHandler:
             if not await self.concurrency_manager.acquire_video(token.id):
                 yield self._create_error_response("视频并发限制已达上限")
                 return
+
+        # return_task_only 模式下，并发槽位应由后台轮询结束后释放
+        should_release_slot_here = not return_task_only
 
         try:
             # 获取模型类型和配置
@@ -1182,6 +1170,20 @@ class GenerationHandler:
             )
             await self.db.create_task(task)
 
+            # 非流式创建任务：后台轮询，立即返回 task_id（供上游 Java/Node 轮询进度）
+            if return_task_only:
+                try:
+                    asyncio.create_task(self._poll_video_result_background(token, project_id, operations, upsample_config))
+                except Exception as e:
+                    debug_logger.log_error(f"[VIDEO] failed to schedule background poll: {e}")
+
+                yield self._create_task_created_completion_response(
+                    task_id=task_id,
+                    model=model_config["model_key"],
+                    prompt=prompt
+                )
+                return
+
             # 轮询结果
             if stream:
                 yield self._create_stream_chunk(f"视频生成中...\n")
@@ -1194,8 +1196,41 @@ class GenerationHandler:
 
         finally:
             # 释放并发槽位
-            if self.concurrency_manager:
+            if self.concurrency_manager and should_release_slot_here:
                 await self.concurrency_manager.release_video(token.id)
+
+    async def _poll_video_result_background(
+        self,
+        token,
+        project_id: str,
+        operations: List[Dict],
+        upsample_config: Optional[Dict] = None
+    ):
+        """后台轮询视频结果：更新 DB，并在结束时释放并发槽位"""
+        try:
+            async for _chunk in self._poll_video_result(token, project_id, operations, False, upsample_config):
+                # 后台模式不需要向外输出 chunk
+                pass
+        except Exception as e:
+            try:
+                op0 = (operations or [])[0] if operations else None
+                tid = op0.get("operation", {}).get("name") if isinstance(op0, dict) else None
+                if tid:
+                    await self.db.update_task(
+                        tid,
+                        status="failed",
+                        error_message=f"后台轮询异常: {str(e)}",
+                        completed_at=time.time()
+                    )
+            except Exception:
+                pass
+            debug_logger.log_error(f"[VIDEO] background poll failed: {e}")
+        finally:
+            try:
+                if self.concurrency_manager:
+                    await self.concurrency_manager.release_video(token.id)
+            except Exception:
+                pass
 
     async def _poll_video_result(
         self,
@@ -1218,6 +1253,14 @@ class GenerationHandler:
         if upsample_config:
             max_attempts = max_attempts * 3  # 放大需要更长时间
 
+        # task_id 用于更新 DB 进度
+        task_id_for_db = None
+        try:
+            if operations and isinstance(operations[0], dict):
+                task_id_for_db = operations[0].get("operation", {}).get("name")
+        except Exception:
+            task_id_for_db = None
+
         for attempt in range(max_attempts):
             await asyncio.sleep(poll_interval)
 
@@ -1233,9 +1276,16 @@ class GenerationHandler:
 
                 # 状态更新 - 每20秒报告一次 (poll_interval=3秒, 20秒约7次轮询)
                 progress_update_interval = 7  # 每7次轮询 = 21秒
-                if stream and attempt % progress_update_interval == 0:  # 每20秒报告一次
+                if attempt % progress_update_interval == 0:  # 每20秒报告一次
                     progress = min(int((attempt / max_attempts) * 100), 95)
-                    yield self._create_stream_chunk(f"生成进度: {progress}%\n")
+                    # 回写 DB 进度（供 /v1/tasks/{task_id} 轮询）
+                    if task_id_for_db:
+                        try:
+                            await self.db.update_task(task_id_for_db, progress=progress)
+                        except Exception:
+                            pass
+                    if stream:
+                        yield self._create_stream_chunk(f"生成进度: {progress}%\n")
 
                 # 检查状态
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
@@ -1364,6 +1414,17 @@ class GenerationHandler:
                 continue
 
         # 超时
+        # 更新 DB 为失败（避免任务永远 processing）
+        if task_id_for_db:
+            try:
+                await self.db.update_task(
+                    task_id_for_db,
+                    status="failed",
+                    error_message=f"视频生成超时 (已轮询{max_attempts}次)",
+                    completed_at=time.time()
+                )
+            except Exception:
+                pass
         yield self._create_error_response(f"视频生成超时 (已轮询{max_attempts}次)")
 
     # ========== 响应格式化 ==========
@@ -1432,6 +1493,44 @@ class GenerationHandler:
                 },
                 "finish_reason": "stop"
             }]
+        }
+
+        return json.dumps(response, ensure_ascii=False)
+
+    def _create_task_created_completion_response(self, task_id: str, model: str, prompt: str) -> str:
+        """非流式：创建视频任务成功后返回（包含 flow2api.task 便于 nodeserve/Java 直接取 task_id）"""
+        import json
+        import time as _time
+
+        payload = {
+            "task_id": task_id,
+            "status": "processing",
+            "progress": 0,
+            "model": model,
+            "prompt": prompt,
+            "result_urls": None,
+            "error_message": None,
+            "created_at": None,
+            "completed_at": None,
+        }
+
+        response = {
+            "id": f"chatcmpl-{int(_time.time())}",
+            "object": "chat.completion",
+            "created": int(_time.time()),
+            "model": "flow2api",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": f"flow2api任务已创建，task_id={task_id}"
+                },
+                "finish_reason": "stop"
+            }],
+            # 非标准扩展字段：aimh8_nodeserve 会读取 openaiResp.flow2api.task
+            "flow2api": {
+                "task": payload
+            }
         }
 
         return json.dumps(response, ensure_ascii=False)
