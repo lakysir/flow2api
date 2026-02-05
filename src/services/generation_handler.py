@@ -8,6 +8,7 @@ from ..core.logger import debug_logger
 from ..core.config import config
 from ..core.models import Task, RequestLog
 from .file_cache import FileCache
+import math
 
 
 # Model configuration
@@ -698,7 +699,7 @@ class GenerationHandler:
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
                 async for chunk in self._handle_video_generation(
-                    token, project_id, model_config, prompt, images, stream, return_task_only=(not stream)
+                    token, project_id, model_config, prompt, images, stream
                 ):
                     yield chunk
 
@@ -959,8 +960,7 @@ class GenerationHandler:
         model_config: dict,
         prompt: str,
         images: Optional[List[bytes]],
-        stream: bool,
-        return_task_only: bool = False
+        stream: bool
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
 
@@ -971,7 +971,8 @@ class GenerationHandler:
                 return
 
         # return_task_only 模式下，并发槽位应由后台轮询结束后释放
-        should_release_slot_here = not return_task_only
+        return_task_only = not stream;
+        should_release_slot_here = not stream
 
         try:
             # 获取模型类型和配置
@@ -1276,19 +1277,16 @@ class GenerationHandler:
                 operation = checked_operations[0]
                 status = operation.get("status")
 
-                # 状态更新 - 每20秒报告一次 (poll_interval=3秒, 20秒约7次轮询)
-                progress_update_interval = 2  # 每2次轮询 = 12秒
-                if attempt % progress_update_interval == 0:  # 每20秒报告一次
-                    progress = min(int((attempt / max_attempts) * 100), 95)
-                    # 回写 DB 进度（供 /v1/tasks/{task_id} 轮询）
-                    if task_id_for_db:
-                        try:
-                            await self.db.update_task(task_id_for_db, progress=progress)
-                        except Exception:
-                            pass
-                    debug_logger.log_warning(f"update task progress: {progress}")
-                    if stream:
-                        yield self._create_stream_chunk(f"生成进度: {progress}%\n")
+                progress = min(math.ceil((attempt / max_attempts) * 100), 95)
+                # 回写 DB 进度（供 /v1/tasks/{task_id} 轮询）
+                if task_id_for_db:
+                    try:
+                        await self.db.update_task(task_id_for_db, progress=progress)
+                    except Exception:
+                        pass
+                debug_logger.log_warning(f"update task progress: {progress}")
+                if stream:
+                    yield self._create_stream_chunk(f"生成进度: {progress}%\n")
 
                 # 检查状态
                 #if status == "MEDIA_GENERATION_STATUS_ACTIVE":
