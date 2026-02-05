@@ -1155,6 +1155,9 @@ class GenerationHandler:
                 yield self._create_error_response("生成任务创建失败")
                 return
 
+            # 检查是否需要放大（必须在 return_task_only 分支之前定义，否则后台轮询调度会失败）
+            upsample_config = model_config.get("upsample")
+
             operation = operations[0]
             task_id = operation["operation"]["name"]
             scene_id = operation.get("sceneId")
@@ -1187,9 +1190,6 @@ class GenerationHandler:
             # 轮询结果
             if stream:
                 yield self._create_stream_chunk(f"视频生成中...\n")
-
-            # 检查是否需要放大
-            upsample_config = model_config.get("upsample")
 
             async for chunk in self._poll_video_result(token, project_id, operations, stream, upsample_config):
                 yield chunk

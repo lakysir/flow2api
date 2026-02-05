@@ -503,7 +503,7 @@ class TokenBrowser:
                     
                 except Exception as e:
                     self._error_count += 1
-                    debug_logger.log_error(f"[BrowserCaptcha] Token-{self.token_id} 浏览器错误: {type(e).__name__}: {str(e)[:200]}")
+                    debug_logger.log_error(f"[BrowserCaptcha] Token-{self.token_id} 浏览器错误: {type(e).__name__}: {str(e)[:1000]}")
                 finally:
                     # 无论成功失败都关闭浏览器
                     await self._close_browser(playwright, browser, context)

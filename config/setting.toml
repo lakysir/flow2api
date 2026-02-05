@@ -7,7 +7,9 @@ admin_password = "admin"
 labs_base_url = "https://labs.google/fx/api"
 api_base_url = "https://aisandbox-pa.googleapis.com/v1"
 timeout = 120
-poll_interval = 3.0
+# 上游视频状态查询间隔（秒）。过低会导致频繁打点/日志刷屏/更易触发风控；
+# 适当调高可以显著降低 batchCheck 调用频率。
+poll_interval = 6.0
 max_poll_attempts = 200
 
 [server]
