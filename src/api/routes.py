@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import List, Optional
+from datetime import datetime
 import base64
 import re
 import json
@@ -262,3 +263,24 @@ async def get_task_status(
         raise HTTPException(status_code=404, detail="task not found")
 
     return JSONResponse(content=_task_to_status_payload(task))
+
+
+@router.get("/v1/stats/video-dispatch")
+async def get_video_dispatch_stats(api_key: str = Depends(verify_api_key_header)):
+    """
+    视频派发统计（并发上限/运行中数量）
+
+    返回结构（给 aimh8_nodeserve /flow2api/video/stats 以及 Java `SoraVideoTaskDispatcher` 使用）：
+    - effectiveTokenCount
+    - globalMax
+    - runningTotal
+    - asOf
+    """
+    if not generation_handler or not getattr(generation_handler, "db", None):
+        raise HTTPException(status_code=500, detail="generation_handler/db not initialized")
+
+    stats = await generation_handler.db.get_video_dispatch_stats()
+    # 兜底：避免下游因缺字段 NPE
+    if "asOf" not in stats:
+        stats["asOf"] = datetime.now().isoformat(timespec="seconds")
+    return JSONResponse(content=stats)

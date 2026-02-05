@@ -776,6 +776,45 @@ class Database:
                 await db.execute(query, params)
                 await db.commit()
 
+    async def get_video_dispatch_stats(self) -> dict:
+        """
+        获取视频派发统计（供 Java 派发器计算全局并发/运行中数量）
+        - effectiveTokenCount: 当前可用于视频生成的 token 数量
+        - globalMax: 可用 token 的并发上限求和（video_concurrency<=0 按 1）
+        - runningTotal: 当前 processing 视频任务数（tasks.status='processing'）
+        - asOf: 统计时间（服务端本地时间）
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            # 1) token 并发统计：排除非激活/禁用视频/被 ban 的 token
+            cursor = await db.execute(
+                """
+                SELECT
+                  COUNT(*) AS effectiveTokenCount,
+                  COALESCE(SUM(CASE WHEN video_concurrency > 0 THEN video_concurrency ELSE 1 END), 0) AS globalMax
+                FROM tokens
+                WHERE is_active = 1
+                  AND video_enabled = 1
+                  AND (ban_reason IS NULL OR ban_reason = '')
+                """
+            )
+            row = await cursor.fetchone()
+            effective = int(row["effectiveTokenCount"] or 0) if row else 0
+            global_max = int(row["globalMax"] or 0) if row else 0
+
+            # 2) 运行中任务数（flow2api 的 tasks 表仅写入视频任务）
+            cursor2 = await db.execute("SELECT COUNT(*) AS runningTotal FROM tasks WHERE status = 'processing'")
+            row2 = await cursor2.fetchone()
+            running_total = int(row2["runningTotal"] or 0) if row2 else 0
+
+            return {
+                "effectiveTokenCount": effective,
+                "globalMax": global_max,
+                "runningTotal": running_total,
+                "asOf": datetime.now().isoformat(timespec="seconds"),
+            }
+
     # Token stats operations (kept for compatibility, now delegates to specific methods)
     async def increment_token_stats(self, token_id: int, stat_type: str):
         """Increment token statistics (delegates to specific methods)"""
